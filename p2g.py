@@ -10,6 +10,14 @@ import sark
 import networkx as nx
 import ida_graph
 
+'''
+1. 选择source函数
+2. 选择sink函数
+3. 选择exclude函数，可选多个，取消则完成选择
+4. 选择是否数据引用
+
+先不排除函数跑一遍，再跑有排除
+'''
 
 class CustomNodeHandler(sark.ui.AddressNodeHandler):
     def on_click(self, value, attrs):
@@ -53,30 +61,34 @@ class P2GPlugin(idaapi.plugin_t):
     wanted_name = "p2g plugin"
     #wanted_hotkey = "Ctrl-Shift-J"
     
-    def findXRefs(self, start: sark.Function, end: sark.Function, path, max_depth, include_data_xref):
+    def findXRefs(self, start: sark.Function, end: sark.Function, path, max_depth, exclude_funcs, include_data_xref):
 
         if max_depth == 0:
-            return False
+            print(f"max depth reached: {start}")
+            return []
         max_depth -= 1
+
+        if start.start_ea in exclude_funcs:
+            print(f"exclude func reached: {start}")
+            return []
+
+        # aviod loop
+        if start in path:  
+            return []
 
         path = path + [start]
 
         if start.start_ea == end.start_ea:
             return [path]
         
-        # 如果当前节点在路径中，避免循环
-        if start in path[:-1]:  
-            return []
         paths = []
+        refs = list(start.xrefs_from) if include_data_xref else list(start.calls_from)
 
-        if include_data_xref:
-            refs = list(start.xrefs_from)
-        else:
-            refs = list(start.calls_from)
-
+        if len(refs) == 0:
+            return []
         for node in refs:  
             # 递归查找路径
-            newpaths = self.findXRefs(sark.Function(ea=node.to), end, path, max_depth, include_data_xref)
+            newpaths = self.findXRefs(sark.Function(ea=node.to), end, path, max_depth, exclude_funcs, include_data_xref)
             for newpath in newpaths:
                 paths.append(newpath)
         
@@ -99,13 +111,22 @@ class P2GPlugin(idaapi.plugin_t):
             return selected_address
         else:
             print("No function selected")
-    def func2(self):
-        print("abababa")
+            return idaapi.BADADDR
+    def get_exclude_funcs(self):
+        exclude_funcs = []
+
+        exclude_addr = self.show_function_chooser("exclude function")
+        while exclude_addr != idaapi.BADADDR:
+            exclude_funcs.append(int(exclude_addr, 16))
+            exclude_addr = self.show_function_chooser("exclude function")
+        print(exclude_funcs)
+        return exclude_funcs
 
     def main(self):
 
         source_func = sark.Function(ea=int(self.show_function_chooser("source function"),16))
         sink_func = int(self.show_function_chooser("sink function"), 16)
+        exclude_funcs = self.get_exclude_funcs()
 
         # 获取目标函数的函数对象
         try:
@@ -130,11 +151,13 @@ class P2GPlugin(idaapi.plugin_t):
         if btn_selected == idaapi.ASKBTN_CANCEL:
             return
 
-        paths = self.findXRefs(source_func, sink_func, [], self.MAX_SEARCH_DEPTH, include_data_xref=True if btn_selected == idaapi.ASKBTN_YES else False)
+        paths = self.findXRefs(source_func, sink_func, [], self.MAX_SEARCH_DEPTH, exclude_funcs,include_data_xref=True if btn_selected == idaapi.ASKBTN_YES else False)
         
         # 添加边
+        cnt = 0
         for path in paths:
-            print(path)
+            print(f"{cnt}: {path}")
+            cnt += 1
             for j in range(len(path)-1):
                 G.add_edge(path[j].ea, path[j+1].ea)
  
