@@ -10,14 +10,6 @@ import sark
 import networkx as nx
 import ida_graph
 
-'''
-1. 选择source函数
-2. 选择sink函数
-3. 选择exclude函数，可选多个，取消则完成选择
-4. 选择是否数据引用
-
-先不排除函数跑一遍，再跑有排除
-'''
 
 class CustomNodeHandler(sark.ui.AddressNodeHandler):
     def on_click(self, value, attrs):
@@ -26,7 +18,6 @@ class CustomNodeHandler(sark.ui.AddressNodeHandler):
             attrs[sark.ui.NXGraph.BG_COLOR] = 0x80 if attrs[sark.ui.NXGraph.BG_COLOR] != 0x80 else 0xffffff 
         else:
             attrs[sark.ui.NXGraph.BG_COLOR] = 0x80
-        #self.update_node_info()
         return True
 
 class NXGraphEx(sark.ui.NXGraph):
@@ -38,19 +29,68 @@ class NXGraphEx(sark.ui.NXGraph):
         self.update_node_info()
         self.Refresh()
         return True
-class FunctionChooser(ida_kernwin.Choose):
-    def __init__(self, title, items):
-        ida_kernwin.Choose.__init__(self, title, [["Function", 20], ["Address", 10]], flags=ida_kernwin.Choose.CH_MODAL)
-        self.items = items
 
-    def OnGetSize(self):
-        return len(self.items)
+class function_chooser_t(ida_kernwin.Choose):
+    """
+    A simple chooser to be used as an embedded chooser
+    """
+    def __init__(self, title, nb=5, flags=ida_kernwin.Choose.CH_MULTI):
+        ida_kernwin.Choose.__init__(
+            self,
+            title,
+            [
+                ["Function", 20],
+                ["Address", 10]
+            ],
+            flags=flags,
+            embedded=True,
+            width=30,
+            height=6)
+
+        self.items = [[ida_funcs.get_func_name(func_ea), f"0x{func_ea:X}"] for func_ea in idautils.Functions()]
+        self.icon = 5
+        # 保存每次选择的项
+        self.sel_items = []
 
     def OnGetLine(self, n):
         return self.items[n]
 
-    def OnClose(self):
-        pass
+    def OnGetSize(self):
+        return len(self.items)
+
+    def OnSelectLine(self, items):
+        selected_items = [self.items[i] for i in items]
+        print("Selected:", selected_items)
+        self.sel_items += [int(self.items[i][1], 16) for i in items]
+        return items
+        
+class FunctionSelectionForm(ida_kernwin.Form):
+
+    def __init__(self):
+        F = ida_kernwin.Form
+        F.__init__(self, r"""STARTITEM 123
+BUTTON YES* Run
+BUTTON CANCEL Cancel
+p2g
+
+<##data ref?## No:{rNo}> <Yes:{rYes}>{iDataXref}> 
+<##max depth## max depth:{iDepth}>                                                         
+<sink:{sourceFunction}> | <source:{sinkFunction}> | <exclude:{excludeFunction}>
+""",
+        { 
+          'iDataXref': F.RadGroupControl(("rYes", "rNo")),
+          'iDepth': F.NumericInput(F.FT_DEC, 20),
+          'sourceFunction': F.EmbeddedChooserControl(function_chooser_t("sourceFunction")),
+          'sinkFunction': F.EmbeddedChooserControl(function_chooser_t("sinkFunction")), 
+          'excludeFunction': F.EmbeddedChooserControl(function_chooser_t("excludeFunction"))
+        })   
+
+    def get_user_data(self):
+        return [self.sourceFunction.value.sel_items, 
+                self.sinkFunction.value.sel_items, 
+                self.excludeFunction.value.sel_items, 
+                False if self.iDataXref.value==0 else True, 
+                self.iDepth.value]
 
 class P2GPlugin(idaapi.plugin_t):
 
@@ -60,10 +100,13 @@ class P2GPlugin(idaapi.plugin_t):
     help = "p2g plugin"
     wanted_name = "p2g plugin"
     #wanted_hotkey = "Ctrl-Shift-J"
+
+    reach_max_depth = False
     
-    def findXRefs(self, start: sark.Function, end: sark.Function, path, max_depth, exclude_funcs, include_data_xref):
+    def findXRefs(self, start, end, path, max_depth, exclude_funcs, include_data_xref):
 
         if max_depth == 0:
+            self.reach_max_depth = True
             print(f"max depth reached: {start}")
             return []
         max_depth -= 1
@@ -93,53 +136,16 @@ class P2GPlugin(idaapi.plugin_t):
                 paths.append(newpath)
         
         return paths
-        
-    def show_function_chooser(self, title="Select Function"):
-        # 收集所有函数名
-        functions = []
-        for func_ea in idautils.Functions():
-            func_name = ida_funcs.get_func_name(func_ea)
-            functions.append([func_name, f"0x{func_ea:X}"])
-
-        # 创建并显示选择器
-        chooser = FunctionChooser(title, functions)
-        selected = chooser.Show(modal=True)
-        
-        if selected != -1:  # 如果用户选择了某个函数
-            selected_function, selected_address = functions[selected]
-            print(f"Selected function: {selected_function}, Address: {selected_address}")
-            return selected_address
-        else:
-            print("No function selected")
-            return idaapi.BADADDR
-    def get_exclude_funcs(self):
-        exclude_funcs = []
-
-        exclude_addr = self.show_function_chooser("exclude function")
-        while exclude_addr != idaapi.BADADDR:
-            exclude_funcs.append(int(exclude_addr, 16))
-            exclude_addr = self.show_function_chooser("exclude function")
-        print(exclude_funcs)
-        return exclude_funcs
 
     def main(self):
 
-        source_func = sark.Function(ea=int(self.show_function_chooser("source function"),16))
-        sink_func = int(self.show_function_chooser("sink function"), 16)
-        exclude_funcs = self.get_exclude_funcs()
-
-        # 获取目标函数的函数对象
-        try:
-            s = sark.Segment(ea=sink_func)
-            if s.name == "UNDEF":
-                sink_func = sark.ExternFunction(ea=sink_func)
-            else:
-                sink_func = sark.Function(ea=sink_func)  # type: ignore
-        except Exception as e:
-            # 如果目标函数不存在，则提示错误
-            # traceback.print_exc()
-            print("Error: target function does not exist!")
-            return
+        form = FunctionSelectionForm()
+        form.Compile()
+        form.Execute()
+        
+        source_func, sink_func, exclude_funcs, idata_xref, max_depth = form.get_user_data()
+        source_func = sark.Function(source_func[0])
+        sink_func = sark.Function(sink_func[0])
           
         # 创建有向图
         G = nx.DiGraph()
@@ -147,11 +153,7 @@ class P2GPlugin(idaapi.plugin_t):
         # 在这里实现查找两个函数之间交叉引用关系的代码...
         print(f"searching a path between func {source_func.demangled} and {sink_func.demangled}, max search depth is {self.MAX_SEARCH_DEPTH}")
 
-        btn_selected = idaapi.ask_yn(idaapi.ASKBTN_NO, "是否包括 data xrefs?")
-        if btn_selected == idaapi.ASKBTN_CANCEL:
-            return
-
-        paths = self.findXRefs(source_func, sink_func, [], self.MAX_SEARCH_DEPTH, exclude_funcs,include_data_xref=True if btn_selected == idaapi.ASKBTN_YES else False)
+        paths = self.findXRefs(source_func, sink_func, [], max_depth, exclude_funcs, idata_xref)
         
         # 添加边
         cnt = 0
@@ -169,12 +171,13 @@ class P2GPlugin(idaapi.plugin_t):
             title = f"{source_func.demangled} -> {sink_func.demangled}"
  
             # Create an NXGraph viewer
-            #viewer = sark.ui.NXGraph(G, handler=CustomNodeHandler(), title=title)
             viewer = NXGraphEx(G, handler=CustomNodeHandler(), title=title)
-            #viewer = CustomGraph("aaa", paths)
  
             # Show the graph
             viewer.Show()
+            if self.reach_max_depth:
+                idaapi.warning("max depth reached, check output")
+
         else:
             idaapi.warning("Cannot find any path!")
 
